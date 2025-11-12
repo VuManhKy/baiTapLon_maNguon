@@ -8,7 +8,7 @@ face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_fronta
 overlay_img = cv2.imread('image.png', cv2.IMREAD_UNCHANGED)  # đọc cả kênh alpha
 
 # Mở webcam
-cam = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+cam = cv2.VideoCapture(0)
 
 while True:
     ret, frame = cam.read()
