@@ -1,5 +1,7 @@
 # nhan_dien_chamcong.py
 # Chương trình nhận diện khuôn mặt và ghi chấm công tự động
+# - Chạy liên tục đến khi tắt (ESC)
+# - Sau 60 giây từ lúc bật cam: ai chưa được nhận diện → ghi "Absent"
 
 from pathlib import Path         # Quản lý đường dẫn file/thư mục tiện hơn
 import json, time, csv           # json dùng đọc tên, time lấy thời gian, csv ghi file csv
@@ -8,12 +10,13 @@ import cv2                       # OpenCV: xử lý ảnh + webcam
 from insightface.app import FaceAnalysis  # Model nhận diện khuôn mặt
 
 # ----------------- ĐƯỜNG DẪN CƠ SỞ DỮ LIỆU -----------------
-DB = Path("db")                              # thư mục chứa embeddings + labels
+DB = Path("db")                               # thư mục chứa embeddings + labels
 ATT = Path("attendance"); ATT.mkdir(exist_ok=True)   # thư mục lưu bảng chấm công
-EMB = DB / "embeddings.npy"                 # file vector embeddings
-LAB = DB / "labels.json"                    # file tên tương ứng embeddings
+EMB = DB / "embeddings.npy"                  # file vector embeddings
+LAB = DB / "labels.json"                     # file tên tương ứng embeddings
 
-THRESH = 0.40  # Ngưỡng quyết định nhận ra hay Unknown (thấp hơn = dễ nhận hơn)
+THRESH = 0.40        # Ngưỡng quyết định nhận ra hay Unknown (thấp hơn = dễ nhận hơn)
+ABSENT_DELAY = 60.0  # Sau 60 giây kể từ khi bật cam sẽ đánh dấu vắng
 
 # ----------------- HÀM TẢI CƠ SỞ DỮ LIỆU -----------------
 def load_db():
@@ -30,31 +33,82 @@ def cosine_sim(a, B):  # a:(512,)  B:(N,512)
     return (B @ a)
 
 # ----------------- GHI DỮ LIỆU CHẤM CÔNG -----------------
-def mark_attendance(person):
+def mark_attendance(person, present_names):
+    """
+    Ghi 1 lần chấm công cho 1 người:
+    - status = "Present"
+    Đồng thời cập nhật tập present_names để sau này biết ai đã có mặt.
+    """
     date = time.strftime("%Y%m%d")           # tên file dạng YYYYMMDD
     fpath = ATT / f"att_{date}.csv"          # ví dụ: attendance/att_20251111.csv
 
-    weekday = time.strftime("%A")            # Thứ (English)
+    weekday  = time.strftime("%A")           # Thứ (English)
     date_str = time.strftime("%Y-%m-%d")     # Ngày đầy đủ
     time_str = time.strftime("%H:%M:%S")     # Giờ hiện tại
-    
+
+    status = "Present"
+
     first = not fpath.exists()               # Nếu file chưa từng được tạo
     with fpath.open("a", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        
-        if first:                            # Tạo dòng tiêu đề lần đầu
-            w.writerow(["weekday", "date", "time", "name"])
-        
-        # Ghi 1 dòng chấm công
-        w.writerow([weekday, date_str, time_str, person])
 
-    print(f"✅ Đã chấm công: {person} lúc {time_str} ngày {date_str} ({weekday})")
+        if first:                            # Tạo dòng tiêu đề lần đầu
+            w.writerow(["weekday", "date", "time", "name", "status"])
+
+        # Ghi 1 dòng chấm công
+        w.writerow([weekday, date_str, time_str, person, status])
+
+    # Đánh dấu là người này đã có mặt
+    present_names.add(person)
+
+    print(f"tk em đi đúng h đấy : {person} lúc {time_str} ngày {date_str} ({weekday}) - {status}")
+
+# ----------------- ĐÁNH DẤU VẮNG CHO NGƯỜI CHƯA ĐIỂM DANH -----------------
+def mark_absent(all_people, present_names):
+    """
+    Sau khi qua ABSENT_DELAY giây:
+    - Người nào trong all_people mà chưa có trong present_names → Absent.
+    - Chỉ chạy 1 lần trong buổi điểm danh.
+    """
+    date = time.strftime("%Y%m%d")
+    fpath = ATT / f"att_{date}.csv"
+
+    weekday  = time.strftime("%A")
+    date_str = time.strftime("%Y-%m-%d")
+    time_str = time.strftime("%H:%M:%S")  # giờ hệ thống tại thời điểm đánh vắng
+
+    first = not fpath.exists()
+
+    with fpath.open("a", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+
+        # Nếu là lần đầu tạo file → ghi header
+        if first:
+            w.writerow(["weekday", "date", "time", "name", "status"])
+
+        # Tìm những người vắng
+        absents = [p for p in all_people if p not in present_names]
+
+        if not absents:
+            print("không ai bị trừ lương hôm nay :((")
+            return
+
+        for person in absents:
+            w.writerow([weekday, date_str, time_str, person, "Absent"])
+            print(f" Vắng tk em : {person} trừ lương nha em ")
 
 # ----------------- CHƯƠNG TRÌNH CHÍNH -----------------
 def main():
-    X, y = load_db()   # Tải embeddings + tên tương ứng
+    # Tải embeddings + tên tương ứng
+    X, y = load_db()
+    # Danh sách tất cả người có trong CSDL (loại trùng nếu có)
+    all_people = sorted(set(y))
 
-    # Khởi tạo mô hình InsightFace, ưu tiên chạy GPU → nhanh hơn
+    # Tập những người đã được nhận diện (đã có mặt)
+    present_names = set()
+
+    # Khởi tạo mô hình InsightFace
+    # Nếu lỗi CUDA thì đổi providers thành ['CPUExecutionProvider']
     app = FaceAnalysis(
         name='buffalo_l',
         providers=['CUDAExecutionProvider', 'CPUExecutionProvider']
@@ -68,10 +122,21 @@ def main():
     if not cap.isOpened():
         raise RuntimeError("Không mở được webcam")
 
-    last_time = {}   # dùng để không chấm công liên tục
-    COOLDOWN = 120    # mỗi người cách nhau 120 giây mới chấm lại
+    last_time = {}        # dùng để không chấm công liên tục
+    COOLDOWN = 120        # mỗi người cách nhau 120 giây mới chấm lại
+    absent_marked = False # đã đánh vắng sau 60 giây chưa?
+
+    start_time = time.time()  # thời điểm bật camera
 
     while True:
+        # Kiểm tra đã qua ABSENT_DELAY giây chưa
+        now = time.time()
+        if (not absent_marked) and (now - start_time >= ABSENT_DELAY):
+            print("đã tới giờ điểm nhanh những con nhựa vắng hôm nay khà khà khà")
+            mark_absent(all_people, present_names)
+            absent_marked = True
+            # KHÔNG thoát, tiếp tục chạy để điểm danh liên tục
+
         ok, frame = cap.read()   # đọc 1 frame từ cam
         if not ok:
             break
@@ -97,13 +162,14 @@ def main():
 
             # Nếu đã nhận ra và đủ thời gian cooldown → ghi công
             if name != "Unknown":
-                now = time.time()
-                if name not in last_time or now - last_time[name] > COOLDOWN:
-                    mark_attendance(name)
-                    last_time[name] = now
+                t_now = time.time()
+                if name not in last_time or t_now - last_time[name] > COOLDOWN:
+                    mark_attendance(name, present_names)
+                    last_time[name] = t_now
 
         cv2.imshow("Attendance", frame)               # hiển thị camera
-        if (cv2.waitKey(1) & 0xFF) == 27:             # ESC → thoát
+        # Nhấn ESC để thoát
+        if (cv2.waitKey(1) & 0xFF) == 27:
             break
 
     cap.release()                                     # giải phóng cam
